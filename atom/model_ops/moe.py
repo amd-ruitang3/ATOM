@@ -18,6 +18,7 @@ from aiter.ops.shuffle import (
     interleave_gate_up_rows,
     moe_shuffle_scale,
     moe_shuffle_weight,
+    shuffle_weight,
 )
 from atom.config import (
     Config,
