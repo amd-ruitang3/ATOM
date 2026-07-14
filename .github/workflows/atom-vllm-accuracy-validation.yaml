@@ -906,7 +906,17 @@ jobs:
       - name: Docker Login
         if: ${{ steps.validation-window.outputs.should_run == 'true' }}
         run: |
+          set -euo pipefail
+          if $CONTAINER_ENGINE image inspect "${OOT_IMAGE_TAG}" >/dev/null 2>&1; then
+            echo "Local OOT image already exists: ${OOT_IMAGE_TAG}; skipping registry login."
+            exit 0
+          fi
+
           REG="${OOT_IMAGE_TAG%%/*}"
+          if [[ "$REG" == localhost* ]]; then
+            echo "Localhost OOT image requested: ${OOT_IMAGE_TAG}; skipping registry login."
+            exit 0
+          fi
           if [[ "$REG" != *.* && "$REG" != localhost* && "$REG" != *:* ]]; then
             REG="docker.io"
           fi
@@ -921,7 +931,22 @@ jobs:
         if: ${{ steps.validation-window.outputs.should_run == 'true' }}
         run: |
           set -euo pipefail
+          if $CONTAINER_ENGINE image inspect "${OOT_IMAGE_TAG}" >/dev/null 2>&1; then
+            echo "Using local OOT image: ${OOT_IMAGE_TAG}"
+            echo "OOT_IMAGE_REF=${OOT_IMAGE_TAG}" >> "$GITHUB_ENV"
+            echo "OOT_IMAGE_IS_LOCAL=true" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
           IMG="${OOT_IMAGE_TAG}"
+          reg="${IMG%%/*}"
+          if [[ "$reg" == localhost* ]]; then
+            echo "::error::Local OOT image ${OOT_IMAGE_TAG} was requested, but it does not exist in the ${CONTAINER_ENGINE} image store on this runner."
+            echo "Available ${CONTAINER_ENGINE} images:"
+            $CONTAINER_ENGINE images || true
+            exit 1
+          fi
+
           if [[ "${CONTAINER_ENGINE}" == "podman" ]]; then
             if [[ "${IMG}" != */* ]]; then
               IMG="docker.io/library/${IMG}"
@@ -933,15 +958,42 @@ jobs:
             fi
           fi
           echo "OOT_IMAGE_REF=${IMG}" >> "$GITHUB_ENV"
+          echo "OOT_IMAGE_IS_LOCAL=false" >> "$GITHUB_ENV"
           echo "Pulling OOT image: ${IMG} (workflow tag: ${OOT_IMAGE_TAG})"
           $CONTAINER_ENGINE pull "${IMG}"
+
+      - name: Prepare OOT runtime image
+        if: ${{ steps.validation-window.outputs.should_run == 'true' }}
+        run: |
+          set -euo pipefail
+          BASE_IMAGE="${OOT_IMAGE_REF:-${OOT_IMAGE_TAG}}"
+          RUNTIME_IMAGE="localhost/atom_oot_runtime:${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT:-0}-${{ strategy.job-index }}"
+          BUILD_CONTEXT="$(mktemp -d)"
+          trap 'rm -rf "${BUILD_CONTEXT}"' EXIT
+
+          cat > "${BUILD_CONTEXT}/Dockerfile" <<EOF
+          FROM ${BASE_IMAGE}
+          RUN rm -f /models && mkdir -p /models /workspace
+          EOF
+
+          $CONTAINER_ENGINE build -t "${RUNTIME_IMAGE}" "${BUILD_CONTEXT}"
+          echo "OOT_BASE_IMAGE_REF=${BASE_IMAGE}" >> "$GITHUB_ENV"
+          echo "OOT_IMAGE_REF=${RUNTIME_IMAGE}" >> "$GITHUB_ENV"
+          echo "OOT_RUNTIME_IMAGE_IS_TEMP=true" >> "$GITHUB_ENV"
+          echo "Prepared OOT runtime image ${RUNTIME_IMAGE} from ${BASE_IMAGE}"
 
       - name: Prepare model cache mount
         if: ${{ steps.validation-window.outputs.should_run == 'true' }}
         run: |
           MODEL_CACHE_MOUNT=""
           MODEL_CACHE_DESC="container-local /models (no host cache mount)"
-          if [ -d "/shared/data/WRH/models" ]; then
+          if [ -d "/shared/data/amd_int/models" ]; then
+            MODEL_CACHE_MOUNT="-v /shared/data/amd_int/models:/models"
+            MODEL_CACHE_DESC="/shared/data/amd_int/models (shared host path)"
+          elif [ -d "/data/amd_int/models" ]; then
+            MODEL_CACHE_MOUNT="-v /data/amd_int/models:/models"
+            MODEL_CACHE_DESC="/data/amd_int/models (shared host path)"
+          elif [ -d "/shared/data/WRH/models" ]; then
             MODEL_CACHE_MOUNT="-v /shared/data/WRH/models:/models"
             MODEL_CACHE_DESC="/shared/data/WRH/models (shared host path)"
           elif [ -d "/it-share/models" ]; then
@@ -980,6 +1032,10 @@ jobs:
           fi
 
           MODEL_MOUNT="${MODEL_CACHE_MOUNT}"
+          GROUP_FLAG=""
+          if [[ "${CONTAINER_ENGINE}" == "podman" ]]; then
+            GROUP_FLAG="--group-add keep-groups"
+          fi
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
 
           {
@@ -994,7 +1050,7 @@ jobs:
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
             $MODEL_MOUNT \
             -w /workspace \
-            --ipc=host --group-add keep-groups \
+            --ipc=host $GROUP_FLAG \
             --privileged \
             --cap-add=SYS_PTRACE \
             --security-opt seccomp=unconfined \
@@ -1476,7 +1532,6 @@ jobs:
           $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/vllm_oot.pid ]; then kill \$(cat /tmp/vllm_oot.pid) || true; fi" || true
           $CONTAINER_ENGINE stop "$CONTAINER_NAME" || true
           $CONTAINER_ENGINE rm "$CONTAINER_NAME" || true
-          $CONTAINER_ENGINE rmi "${OOT_IMAGE_REF:-${OOT_IMAGE_TAG}}" || true
 
   oot-model-accuracy-priority-2:
     name: Model Accuracy ${{ matrix.priority }} (${{ matrix.model_name }})
